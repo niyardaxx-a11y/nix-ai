@@ -14,6 +14,7 @@ Upgrades in this version:
 import streamlit as st
 import streamlit.components.v1 as components
 import json
+from datetime import datetime, timedelta, timezone
 import random
 import time
 import base64
@@ -60,6 +61,10 @@ except Exception:
 MODEL_NAME = "gemini-3.6-flash"  # current model; gemini-2.5-flash is no longer available to new users
 OTP_VALID_SECONDS = 300  # 5 min
 ADMIN_PHONES = {"8822166691"}  # owner number(s) allowed to open the admin dashboard
+try:
+    DAILY_MESSAGE_CAP = int(st.secrets["DAILY_CAP"])  # change it in Secrets, no code edit needed
+except Exception:
+    DAILY_MESSAGE_CAP = 30  # messages per person per day; the owner is exempt
 
 st.set_page_config(page_title="NIX AI", page_icon="⚡", layout="centered")
 
@@ -188,6 +193,77 @@ def db_admin_stats():
     return stats
 
 
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _today_ist() -> str:
+    return datetime.now(_IST).strftime("%Y-%m-%d")
+
+
+def _ist_midnight_utc() -> str:
+    """Start of today in IST, written as a UTC timestamp the database understands."""
+    start = datetime.now(_IST).replace(hour=0, minute=0, second=0, microsecond=0)
+    return start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def db_count_user_messages_today(phone):
+    """Messages this person has sent since midnight IST. None if it can't be checked."""
+    if not db_available():
+        return None
+    try:
+        convs = (
+            sb.table("conversations").select("id").eq("phone", phone)
+            .order("created_at", desc=True).limit(200).execute().data or []
+        )
+        ids = [c["id"] for c in convs]
+        if not ids:
+            return 0
+        res = (
+            sb.table("messages").select("id", count="exact")
+            .in_("conversation_id", ids).eq("role", "user")
+            .gte("created_at", _ist_midnight_utc()).limit(1).execute()
+        )
+        return res.count or 0
+    except Exception:
+        return None
+
+
+def daily_cap_for(phone):
+    """None means unlimited (the owner)."""
+    return None if phone in ADMIN_PHONES else DAILY_MESSAGE_CAP
+
+
+def messages_used_today(phone, refresh=False):
+    """Today's count, cached per session. refresh=True re-reads it from the database."""
+    today = _today_ist()
+    cache = st.session_state.get("_cap_cache")
+    same = bool(cache) and cache.get("day") == today and cache.get("phone") == phone
+    if refresh or not same:
+        n = db_count_user_messages_today(phone)
+        if n is None:  # database hiccup: don't lock anyone out, keep the last known number
+            n = cache["used"] if same else 0
+        st.session_state._cap_cache = {"day": today, "phone": phone, "used": n}
+    return st.session_state._cap_cache["used"]
+
+
+def _bump_cap_cache():
+    cache = st.session_state.get("_cap_cache")
+    if cache and cache.get("day") == _today_ist():
+        cache["used"] += 1
+
+
+def within_daily_cap():
+    """True if the signed-in person can send another message. Shows a notice if not."""
+    phone = st.session_state.phone
+    cap = daily_cap_for(phone)
+    if cap is None:
+        return True
+    if messages_used_today(phone, refresh=True) >= cap:
+        st.warning(f"You've used all {cap} messages for today. Your limit resets at 12:00 AM IST.")
+        return False
+    return True
+
+
 def db_get_user(phone):
     if not db_available():
         return None
@@ -253,6 +329,7 @@ defaults = {
     "_regen_index": None,              # index of the assistant message being regenerated
     "_show_admin": False,              # owner-only admin dashboard view
     "_study_prompt": None,             # prompt queued by the Study mode buttons
+    "_cap_cache": None,                # {day, phone, used} for the daily message cap
 }
 for key, val in defaults.items():
     if key not in st.session_state:
@@ -900,6 +977,11 @@ def main_app():
             st.session_state.current_conversation_id = None
             st.rerun()
 
+        _cap = daily_cap_for(st.session_state.phone)
+        if _cap is not None and db_available():
+            _used = messages_used_today(st.session_state.phone)
+            st.caption(f"💬 {max(_cap - _used, 0)} of {_cap} messages left today")
+
         if db_available():
             convos = db_list_conversations(st.session_state.phone)
             if not convos:
@@ -1011,6 +1093,8 @@ def main_app():
     if st.session_state.get("_regen_index") is not None:
         idx = st.session_state._regen_index
         st.session_state._regen_index = None
+        if not within_daily_cap():
+            idx = -1  # at the limit: skip the regeneration
         if 0 <= idx < len(st.session_state.messages) and st.session_state.messages[idx]["role"] == "assistant":
             prev_user_msg = None
             for j in range(idx - 1, -1, -1):
@@ -1083,6 +1167,12 @@ def main_app():
                 if st.button(s, key=f"quick_{i}", use_container_width=True):
                     quick_prompt = s
 
+    _cap = daily_cap_for(st.session_state.phone)
+    if _cap is not None and db_available():
+        _left = _cap - messages_used_today(st.session_state.phone)
+        if 0 < _left <= 5:
+            st.caption(f"⚠️ {_left} message{'s' if _left != 1 else ''} left today")
+
     # Message box with a built-in attach icon — tapping it on mobile opens the
     # phone's own native Camera / Photo Library picker, just like a normal chat app.
     user_input = st.chat_input(
@@ -1101,6 +1191,9 @@ def main_app():
     elif st.session_state.get("_study_prompt"):
         effective_text = st.session_state._study_prompt
         st.session_state._study_prompt = None
+
+    if (effective_text or effective_files) and not within_daily_cap():
+        effective_text, effective_files = None, []
 
     if effective_text or effective_files:
         text = effective_text or ""
@@ -1129,6 +1222,7 @@ def main_app():
         st.markdown(_bubble_html(display_text, "user", image_data_uri), unsafe_allow_html=True)
         # Photos aren't stored in the database yet — only the text is saved for history
         db_save_message(st.session_state.current_conversation_id, "user", display_text or "[Photo]")
+        _bump_cap_cache()
 
         placeholder = st.empty()
         placeholder.markdown(_loading_bubble_html(), unsafe_allow_html=True)
