@@ -16,6 +16,7 @@ import streamlit.components.v1 as components
 import json
 from datetime import datetime, timedelta, timezone
 import random
+import re
 import time
 import base64
 import io
@@ -564,27 +565,36 @@ def extract_text(uploaded_file):
         return None
 
 
-def _with_retry(fn, max_attempts=4, base_delay=1.0):
-    """
-    Runs fn() with automatic retries on transient errors (503 overloaded,
-    429 rate-limited, timeouts, connection resets). Uses exponential backoff
-    so a busy Gemini server doesn't kill the demo — it just quietly retries.
-    Raises the last exception if all attempts fail.
-    """
-    transient_markers = ["503", "overloaded", "429", "rate limit", "timeout",
-                          "unavailable", "deadline", "connection reset", "temporarily"]
-    last_err = None
+def _classify_error(e) -> str:
+    """Sort an API error into: auth, missing, quota_day, quota_minute, transient, other."""
+    t = str(e).lower()
+    squashed = t.replace(" ", "").replace("_", "")
+    code = getattr(e, "code", None)
+    if not isinstance(code, int):
+        code = getattr(e, "status_code", None)
+    if code in (401, 403) or any(k in t for k in ("api key not valid", "api_key_invalid", "unauthenticated", "permission_denied")):
+        return "auth"
+    if code == 404 or any(k in t for k in ("not_found", "no longer available", "is not found")):
+        return "missing"
+    if code == 429 or any(k in t for k in ("resource_exhausted", "quota", "rate limit", "429")):
+        if any(k in squashed for k in ("perday", "requestsperday", "daily")):
+            return "quota_day"
+        return "quota_minute"
+    if code in (500, 502, 503, 504) or any(k in t for k in ("503", "overloaded", "unavailable", "deadline", "timeout", "timed out", "connection", "temporarily")):
+        return "transient"
+    return "other"
+
+
+def _with_retry(fn, max_attempts=3, base_delay=1.0):
+    """Retries only short hiccups (503, timeouts). Quota, missing-model and key errors fail
+    straight away, because waiting won't fix them."""
     for attempt in range(max_attempts):
         try:
             return fn()
         except Exception as e:
-            last_err = e
-            err_text = str(e).lower()
-            is_transient = any(marker in err_text for marker in transient_markers)
-            if not is_transient or attempt == max_attempts - 1:
+            if _classify_error(e) != "transient" or attempt == max_attempts - 1:
                 raise
-            time.sleep(base_delay * (2 ** attempt))  # 1s, 2s, 4s, ...
-    raise last_err
+            time.sleep(base_delay * (2 ** attempt))  # 1s, 2s
 
 
 FOUNDER_ANSWER = "Yo 👋 I was built by NIYAR DAS — the mastermind behind NIX AI"
@@ -705,6 +715,193 @@ def _loading_bubble_html() -> str:
     )
 
 
+# ---------------------------------------------------------------------
+# MODEL LADDER: free quotas are per model, so when one is used up we move to the next
+# ---------------------------------------------------------------------
+_DEFAULT_MODELS = [MODEL_NAME, "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+_COOLDOWN = {"quota_day": 3600, "quota_minute": 60, "missing": 6 * 3600, "transient": 20}
+
+
+def _model_ladder():
+    """Models to try, in order. Set MODEL_NAMES in Secrets (a list or comma-separated) to change them."""
+    try:
+        raw = st.secrets["MODEL_NAMES"]
+    except Exception:
+        raw = None
+    if raw:
+        names = [x.strip() for x in raw.split(",")] if isinstance(raw, str) else [str(x).strip() for x in list(raw)]
+        names = [n for n in names if n]
+        if names:
+            return names
+    return list(_DEFAULT_MODELS)
+
+
+@st.cache_resource
+def _quota_board():
+    """Shared by every visitor while the app runs: model -> {"until": timestamp, "why": reason}."""
+    return {}
+
+
+def _bench(model, kind, err_text=""):
+    """Rest a model for a while so nobody waits on one we already know is out."""
+    seconds = _COOLDOWN.get(kind, 60)
+    if kind == "quota_minute":
+        m = re.search(r"retrydelay\W+(\d+)", err_text.lower())
+        if m:
+            seconds = min(max(int(m.group(1)) + 2, 5), 300)
+    _quota_board()[model] = {"until": time.time() + seconds, "why": kind}
+
+
+def _live_models():
+    now = time.time()
+    board = _quota_board()
+    return [m for m in _model_ladder() if board.get(m, {}).get("until", 0) <= now]
+
+
+class _AllModelsDown(Exception):
+    pass
+
+
+def _ai_down_message():
+    now = time.time()
+    board = _quota_board()
+    ladder = _model_ladder()
+    waits = [(board[m]["until"] - now, board[m]["why"]) for m in ladder if m in board and board[m]["until"] > now]
+    if not waits:
+        return "⚠️ NIX AI is busy right now. Please try again in a minute."
+    if len(waits) == len(ladder) and all(why == "missing" for _, why in waits):
+        return "⚠️ The AI models aren't available right now. (Owner: check MODEL_NAMES in Secrets.)"
+    wait, why = min(waits)
+    if wait <= 120:
+        if why == "transient":
+            return "⚠️ Gemini's servers are busy right now. Please try again in a few seconds."
+        return "⚠️ NIX AI is getting a lot of requests right now. Please try again in a minute."
+    return "⚠️ NIX AI's free quota for today is used up. It should reset around 1 PM IST, please try again then. 🙏"
+
+
+def _run_ladder(call):
+    """Try each live model in turn. call(model) returns the reply text."""
+    for model in _live_models():
+        try:
+            return call(model)
+        except Exception as e:
+            kind = _classify_error(e)
+            if kind in ("auth", "other"):
+                raise  # another model won't fix a bad key or a bad request
+            _bench(model, kind, str(e))
+    raise _AllModelsDown(_ai_down_message())
+
+
+def _friendly_error(e, prefix="⚠️ Something went wrong talking to Gemini:"):
+    kind = _classify_error(e)
+    if kind == "transient":
+        return "⚠️ Gemini's servers are busy right now. Please try again in a few seconds."
+    if kind == "auth":
+        return "⚠️ API key issue — please check the key in Settings/Secrets."
+    return f"{prefix} {e}"
+
+
+def _type_out(text, placeholder):
+    if not placeholder:
+        return
+    for partial in _typewriter(text):
+        placeholder.markdown(_bubble_html(partial + "▌", "assistant"), unsafe_allow_html=True)
+    placeholder.markdown(_bubble_html(text, "assistant"), unsafe_allow_html=True)
+
+
+def _call_model(model, full_prompt, contents, stream_placeholder):
+    """One model, best API first. Returns the reply text, or raises the API's error."""
+    if hasattr(client, "interactions"):
+        try:
+            if stream_placeholder:
+                stream_placeholder.markdown(_loading_bubble_html(), unsafe_allow_html=True)
+            result = _with_retry(lambda: client.interactions.create(model=model, input=full_prompt))
+            text = result.output_text
+            if not text:
+                raise ValueError("The model returned an empty reply")
+            _type_out(text, stream_placeholder)
+            return text
+        except Exception as e:
+            if _classify_error(e) != "other":
+                raise
+            # the Interactions API isn't usable here (older SDK or key): use the classic API below
+    if hasattr(client.models, "generate_content_stream"):
+        try:
+            def _run_stream():
+                collected = ""
+                for chunk in client.models.generate_content_stream(model=model, contents=contents):
+                    piece = getattr(chunk, "text", "") or ""
+                    collected += piece
+                    if stream_placeholder:
+                        stream_placeholder.markdown(_bubble_html(collected + "▌", "assistant"), unsafe_allow_html=True)
+                return collected
+            collected = _with_retry(_run_stream)
+            if not collected:
+                raise ValueError("The model returned an empty reply")
+            if stream_placeholder:
+                stream_placeholder.markdown(_bubble_html(collected, "assistant"), unsafe_allow_html=True)
+            return collected
+        except Exception as e:
+            if _classify_error(e) != "other":
+                raise
+    response = _with_retry(lambda: client.models.generate_content(model=model, contents=contents))
+    text = response.text
+    if not text:
+        raise ValueError("The model returned an empty reply")
+    _type_out(text, stream_placeholder)
+    return text
+
+
+# ---------------------------------------------------------------------
+# READY-MADE REPLIES: "hi", "thanks" and friends don't need the AI (saves quota)
+# ---------------------------------------------------------------------
+_GREET_RE = re.compile(r"^(h+i+|he+y+|he+l+o+|yo+|hola|namaste|namaskar|ram ram|sup|gm|good (morning|afternoon|evening))( (there|bro|buddy|nix|nix ai|bhai|dost))?$")
+_THANKS_RE = re.compile(r"^(thanks?|thank you|thank u|thanku|thx|ty|shukriya|dhanyavad|dhanyawad)( (a lot|so much|nix|bro|bhai|again))*$")
+_BYE_RE = re.compile(r"^(bye+|good ?bye|see you|see ya|ok bye|okay bye|tata|gn|good night|shubh ratri)$")
+_ACK_RE = re.compile(r"^(ok+|okay+|okk+|k|kk|alright|cool|nice|great|got it|theek hai|thik hai|acha|accha|hmm+|hm+)$")
+
+
+def _local_reply(text, history):
+    """A canned reply for a bare greeting / thanks / goodbye / 'ok', else None (the AI answers)."""
+    if not text or "?" in text:
+        return None
+    t = re.sub(r"[^a-z0-9\u0900-\u097f ]+", " ", text.lower())
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t or len(t.split()) > 5:
+        return None
+    name = (st.session_state.get("name") or "").strip()
+    who = f" {name}" if name else ""
+    casual = st.session_state.get("ai_tone") == "Casual / Gen-Z"
+    if _GREET_RE.match(t):
+        return random.choice([f"Yo{who}! 👋 What's up?", f"Heyy{who} 👋 What are we doing today?"] if casual
+                             else [f"Hello{who}! 👋 How can I help you today?", f"Hi{who}! What can I help you with?"])
+    if _THANKS_RE.match(t):
+        return random.choice(["Anytime! 🙌", "You got it 😎 Anything else?"] if casual
+                             else ["You're welcome! 😊 Anything else I can help with?", "Happy to help! Let me know if you need anything else."])
+    if _BYE_RE.match(t):
+        return random.choice(["See you! 👋", "Take care! 👋"])
+    if _ACK_RE.match(t):
+        last = next((m for m in reversed(history or []) if m.get("role") == "assistant"), None)
+        if last and "?" in (last.get("content") or "")[-200:]:
+            return None  # the AI just asked something, so "ok" is a real answer
+        return "👍 Let me know if you need anything else."
+    return None
+
+
+def _is_local_prompt(text, history):
+    return bool(_is_founder_question(text) or _is_niyar_bio_question(text) or _local_reply(text, history))
+
+
+def ai_available(text="", has_image=False):
+    """False (with a notice) only when every model is known to be out and this message needs the AI."""
+    if client is None or _live_models():
+        return True
+    if text and not has_image and _is_local_prompt(text, st.session_state.messages):
+        return True
+    st.warning(_ai_down_message())
+    return False
+
+
 def ask_ai(prompt, system_context="", stream_placeholder=None):
     """
     Calls Gemini. If the SDK supports streaming (generate_content_stream), uses it
@@ -727,6 +924,12 @@ def ask_ai(prompt, system_context="", stream_placeholder=None):
                 stream_placeholder.markdown(_bubble_html(partial + "▌", "assistant"), unsafe_allow_html=True)
             stream_placeholder.markdown(_bubble_html(NIYAR_BIO_ANSWER, "assistant"), unsafe_allow_html=True)
         return NIYAR_BIO_ANSWER
+
+    # Greetings / thanks / goodbyes get a ready-made reply, no AI call
+    local = _local_reply(prompt, st.session_state.messages[:-1])
+    if local:
+        _type_out(local, stream_placeholder)
+        return local
 
     if client is None:
         msg = "⚠️ Please update `API_KEY` in the code with a valid Gemini key from Google AI Studio (starts with `AQ.` or `AIzaSy`)!"
@@ -754,22 +957,6 @@ def ask_ai(prompt, system_context="", stream_placeholder=None):
         full_prompt += f"Conversation so far:\n{transcript}\n"
     full_prompt += f"User: {prompt}"
 
-    # --- Path 1: Interactions API (recommended for new "AQ." auth keys) ---
-    try:
-        if hasattr(client, "interactions"):
-            if stream_placeholder:
-                stream_placeholder.markdown(_loading_bubble_html(), unsafe_allow_html=True)
-            result = _with_retry(lambda: client.interactions.create(model=MODEL_NAME, input=full_prompt))
-            text = result.output_text
-            if stream_placeholder:
-                for partial in _typewriter(text):
-                    stream_placeholder.markdown(_bubble_html(partial + "▌", "assistant"), unsafe_allow_html=True)
-                stream_placeholder.markdown(_bubble_html(text, "assistant"), unsafe_allow_html=True)
-            return text
-    except Exception:
-        pass  # fall through to legacy path below (e.g. older SDK, legacy AIzaSy key)
-
-    # --- Path 2: legacy models.generate_content (works with older AIzaSy keys) ---
     history_formatted = [
         {
             "role": "user" if m["role"] == "user" else "model",
@@ -780,45 +967,14 @@ def ask_ai(prompt, system_context="", stream_placeholder=None):
     contents = history_formatted + [{"role": "user", "parts": [{"text": full_prompt}]}]
 
     try:
-        if hasattr(client.models, "generate_content_stream"):
-            def _run_stream():
-                collected = ""
-                for chunk in client.models.generate_content_stream(model=MODEL_NAME, contents=contents):
-                    piece = getattr(chunk, "text", "") or ""
-                    collected += piece
-                    if stream_placeholder:
-                        stream_placeholder.markdown(_bubble_html(collected + "▌", "assistant"), unsafe_allow_html=True)
-                return collected
-            collected = _with_retry(_run_stream)
-            if stream_placeholder:
-                stream_placeholder.markdown(_bubble_html(collected, "assistant"), unsafe_allow_html=True)
-            return collected
-    except Exception:
-        pass
-
-    try:
-        response = _with_retry(lambda: client.models.generate_content(model=MODEL_NAME, contents=contents))
-        text = response.text
-        if stream_placeholder:
-            for partial in _typewriter(text):
-                stream_placeholder.markdown(_bubble_html(partial + "▌", "assistant"), unsafe_allow_html=True)
-            stream_placeholder.markdown(_bubble_html(text, "assistant"), unsafe_allow_html=True)
-        return text
+        return _run_ladder(lambda model: _call_model(model, full_prompt, contents, stream_placeholder))
+    except _AllModelsDown as down:
+        err = str(down)
     except Exception as e:
-        # Friendly message instead of a raw stack trace / error code —
-        # so a demo never shows something scary like "503" on screen.
-        err_text = str(e).lower()
-        if any(m in err_text for m in ["503", "overloaded", "unavailable"]):
-            err = "⚠️ Gemini's servers are busy right now. Please try again in a few seconds."
-        elif "429" in err_text or "rate limit" in err_text:
-            err = "⚠️ Too many requests right now — please wait a moment and try again."
-        elif "401" in err_text or "unauthenticated" in err_text or "invalid" in err_text:
-            err = "⚠️ API key issue — please check the key in Settings/Secrets."
-        else:
-            err = f"⚠️ Something went wrong talking to Gemini: {e}"
-        if stream_placeholder:
-            stream_placeholder.markdown(_bubble_html(err, "assistant"), unsafe_allow_html=True)
-        return err
+        err = _friendly_error(e)
+    if stream_placeholder:
+        stream_placeholder.markdown(_bubble_html(err, "assistant"), unsafe_allow_html=True)
+    return err
 
 
 def ask_ai_vision(prompt, image_bytes, mime_type="image/jpeg", stream_placeholder=None):
@@ -838,25 +994,23 @@ def ask_ai_vision(prompt, image_bytes, mime_type="image/jpeg", stream_placeholde
         ],
     }]
 
-    try:
-        response = _with_retry(lambda: client.models.generate_content(model=MODEL_NAME, contents=contents))
+    def _vision_call(model):
+        response = _with_retry(lambda: client.models.generate_content(model=model, contents=contents))
         text = response.text
-        if stream_placeholder:
-            for partial in _typewriter(text):
-                stream_placeholder.markdown(_bubble_html(partial + "▌", "assistant"), unsafe_allow_html=True)
-            stream_placeholder.markdown(_bubble_html(text, "assistant"), unsafe_allow_html=True)
+        if not text:
+            raise ValueError("The model returned an empty reply")
+        _type_out(text, stream_placeholder)
         return text
+
+    try:
+        return _run_ladder(_vision_call)
+    except _AllModelsDown as down:
+        err = str(down)
     except Exception as e:
-        err_text = str(e).lower()
-        if any(m in err_text for m in ["503", "overloaded", "unavailable"]):
-            err = "⚠️ Gemini's servers are busy right now. Please try again in a few seconds."
-        elif "429" in err_text or "rate limit" in err_text:
-            err = "⚠️ Too many requests right now — please wait a moment and try again."
-        else:
-            err = f"⚠️ Couldn't analyze the image: {e}"
-        if stream_placeholder:
-            stream_placeholder.markdown(_bubble_html(err, "assistant"), unsafe_allow_html=True)
-        return err
+        err = _friendly_error(e, prefix="⚠️ Couldn't analyze the image:")
+    if stream_placeholder:
+        stream_placeholder.markdown(_bubble_html(err, "assistant"), unsafe_allow_html=True)
+    return err
 
 
 # ---------------------------------------------------------------------
@@ -948,6 +1102,22 @@ def render_admin_dashboard():
     c1.metric("Users", stats["users"] if stats["users"] is not None else "—")
     c2.metric("Chats", stats["conversations"] if stats["conversations"] is not None else "—")
     c3.metric("Messages", stats["messages"] if stats["messages"] is not None else "—")
+    st.markdown("#### AI models")
+    now = time.time()
+    board = _quota_board()
+    model_rows = []
+    for i, m in enumerate(_model_ladder(), 1):
+        b = board.get(m)
+        if b and b["until"] > now:
+            label = {"quota_day": "daily quota used up", "quota_minute": "rate-limited", "missing": "not found", "transient": "busy"}.get(b["why"], b["why"])
+            status = f"{label} (retry in ~{max(1, int((b['until'] - now) / 60))} min)"
+        else:
+            status = "ready"
+        model_rows.append({"Order": i, "Model": m, "Status": status})
+    st.dataframe(model_rows, hide_index=True, use_container_width=True)
+    if st.button("Re-check models now", key="recheck_models"):
+        board.clear()
+        st.rerun()
     st.markdown("#### Recent signups")
     rows = []
     for u in stats["recent_users"]:
@@ -1093,8 +1263,8 @@ def main_app():
     if st.session_state.get("_regen_index") is not None:
         idx = st.session_state._regen_index
         st.session_state._regen_index = None
-        if not within_daily_cap():
-            idx = -1  # at the limit: skip the regeneration
+        if not (within_daily_cap() and ai_available()):
+            idx = -1  # at the limit, or the AI is out: keep the existing reply
         if 0 <= idx < len(st.session_state.messages) and st.session_state.messages[idx]["role"] == "assistant":
             prev_user_msg = None
             for j in range(idx - 1, -1, -1):
@@ -1192,7 +1362,9 @@ def main_app():
         effective_text = st.session_state._study_prompt
         st.session_state._study_prompt = None
 
-    if (effective_text or effective_files) and not within_daily_cap():
+    if (effective_text or effective_files) and not (
+        within_daily_cap() and ai_available(effective_text or "", bool(effective_files))
+    ):
         effective_text, effective_files = None, []
 
     if effective_text or effective_files:
